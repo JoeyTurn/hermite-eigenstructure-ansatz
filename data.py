@@ -84,10 +84,15 @@ def compute_hermite_basis(X, monomials, is_X_PCAd=False):
     X_PCA = ensure_numpy(X)
 
     hermites = get_hermite_polynomials()
+    
+    if type(monomials) != list:
+        monomials = [monomials]
+
     H = np.zeros((N, len(monomials)))
     for i, monomial in enumerate(monomials):
         h = np.ones(N) / np.sqrt(N)
         for d_i, exp in monomial.items():
+            d_i = int(d_i) #failsafe for when monomials aren't hard coded
             Z = np.sqrt(math.factorial(exp))
             h *= hermites[exp](X_PCA[:, d_i]) / Z
         H[:, i] = h
@@ -135,12 +140,21 @@ def preprocess(X, **kwargs):
     return X
 
 # for mlps
+
+def get_synthetic_X(d=500, N=15000, offset=3, alpha=1.5, data_eigvals = None, gen=None, **kwargs):
+    """
+    Powerlaw synthetic data
+    """
+    data_eigvals = ensure_torch(get_powerlaw(d, alpha, offset=offset, normalize=True) if data_eigvals is None else data_eigvals)
+    X = ensure_torch(torch.normal(0, 1, (N, d), generator=gen, device=data_eigvals.device)) * torch.sqrt(data_eigvals)
+    return X, data_eigvals
+
 def get_new_polynomial_data(lambdas, Vt, monomials, dim, N, data_eigvals, N_original,
-                            new_X_fn=notebook_fns.get_synthetic_X, coeffs=1, gen=None):
+                            new_X_fn=get_synthetic_X, coeffs=1, gen=None):
     new_X_args = dict(d=dim, N=N, data_eigvals=data_eigvals, gen=gen)
     X_new, _ = new_X_fn(**new_X_args)
     pca_x = X_new @ Vt.T @ torch.diag(lambdas**(-1.)) * N_original**(0.5)
-    y_new = coeffs*get_matrix_hermites(pca_x, monomials, previously_normalized=True)*N**(0.5)
+    y_new = coeffs*get_matrix_hermites(X=pca_x, monomials=monomials, previously_normalized=True)*N**(0.5)
     if y_new.ndim == 2:
         y_new = y_new.sum(axis=1)/y_new.shape[1]
     return X_new, y_new
@@ -150,7 +164,6 @@ def polynomial_batch_fn(lambdas, Vt, monomials, bsz, data_eigvals, N,
                   X=None, y=None, data_creation_fn=get_new_polynomial_data, gen=None):
     lambdas, Vt, data_eigvals = map(ensure_torch, (lambdas, Vt, data_eigvals))
     dim = len(data_eigvals)
-    
     def batch_fn(step: int, X=X, y=y):
         if (X is not None) and (y is not None):
             X_fixed = ensure_torch(X)

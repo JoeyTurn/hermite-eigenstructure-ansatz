@@ -45,13 +45,18 @@ def centeredMLP(model: nn.Module, baseline_dtype=None) -> nn.Module:
 
 
 class MLP(nn.Module):
-    def __init__(self, d_in=1, width=4096, depth=2, d_out=1, bias=True, nonlinearity=None):
+    def __init__(self, d_in=1, width=4096, depth=2, d_out=1, bias=True, nonlinearity=None, forcezeros=False):
         super().__init__()
         self.d_in, self.width, self.depth, self.d_out = d_in, width, depth, d_out
 
         self.input_layer = nn.Linear(d_in, width, bias)
         self.hidden_layers = nn.ModuleList([nn.Linear(width, width, bias) for _ in range(depth - 1)])
         self.output_layer = nn.Linear(width, d_out, bias)
+        if forcezeros:
+            with torch.no_grad():
+                self.output_layer.weight.zero_()
+                if self.output_layer.bias is not None:
+                    self.output_layer.bias.zero_()
         self.nonlin = nonlinearity if nonlinearity is not None else nn.ReLU()
         
     def forward(self, x):
@@ -85,15 +90,23 @@ def train_network(model, batch_function, lr=1e-2, max_iter=int(1e3), loss_checkp
     - If only_thresholds is True, only returns the timekeys and not the full loss curves.
     """
 
-    def return_statement(model, ema_tr, ema_te, timekeys, tr_losses=None, te_losses=None):
+    def return_statement(model, ema_tr, ema_te, timekeys, tr_losses=None, te_losses=None, extras={}):
         if only_thresholds:
-            return {"model": model, "train_losses": ema_tr, "test_losses": ema_te, "timekeys": timekeys}
-        return {"model": model, "train_losses": tr_losses, "test_losses": te_losses, "timekeys": timekeys}
+            extras.update({"model": model, "train_losses": ema_tr, "test_losses": ema_te, "timekeys": timekeys})
+            return extras
+        # if otherreturns is not None:
+        #     for name, _ in items:
+        #         extras[name] = np.array(extras[name])
+        extras.update({"model": model, "train_losses": tr_losses, "test_losses": te_losses, "timekeys": timekeys})
+        return extras 
 
-    def fill_losses(tr_losses, te_losses, i):
+    def fill_losses(tr_losses, te_losses, extras, i):
         tr_losses[i:] = tr_losses[i]
         te_losses[i:] = te_losses[i]
-        return tr_losses, te_losses
+        if otherreturns is not None:
+            for name, _ in list(otherreturns.items()):
+                extras[name][i:] = extras[name][i]
+        return tr_losses, te_losses, extras
     
     #checking if losses are absolute or relative
     has_abs = (loss_checkpoints is not None) and len(loss_checkpoints) > 0
@@ -114,19 +127,32 @@ def train_network(model, batch_function, lr=1e-2, max_iter=int(1e3), loss_checkp
     thresholds = np.sort(thresholds)[::-1] # descending
     timekeys = np.full(thresholds.shape, 0, dtype=int)
 
+    otherreturns = kwargs.get("otherreturns", None)
+    if type(otherreturns) is dict:
+        items = list(otherreturns.items())
+    extras = {}
+
     if not(only_thresholds):
         tr_losses = np.empty(max_iter, dtype=float)
         te_losses = np.empty(max_iter, dtype=float)
+        # if otherreturns is not None:
+        #     for name, _ in items:
+                # extras[name] = np.empty((max_iter, 200, 200), dtype=float) #temporary, this is gonna need to be CHANGED
+                # extras[name] = []#np.empty(max_iter, dtype=float)
     else:
         tr_losses = te_losses = None
+        if otherreturns is not None:
+            for name, _ in items:
+                extras[name] = None
     ema = None
     pointer = 0   
     X_tr_not_provided = X_tr is None
 
     # training loop 
-    for i in range(max_iter):
+    # print("Starting training loop...")
+    for i in range(int(max_iter)):
         X_tr, y_tr = batch_function(i)
-    
+        
         opt.zero_grad()
         out = model(X_tr).squeeze()
         loss = loss_fn(out, y_tr.squeeze())
@@ -141,7 +167,6 @@ def train_network(model, batch_function, lr=1e-2, max_iter=int(1e3), loss_checkp
                 out = model(X_te).squeeze()
                 loss = loss_fn(out, y_te.squeeze())
                 te_loss_val = float(loss.item())
-
         # initialize thresholds & loss trace baseline at first step
         if i == 0:
             ema_tr = tr_loss_val
@@ -150,14 +175,25 @@ def train_network(model, batch_function, lr=1e-2, max_iter=int(1e3), loss_checkp
                 thresholds *= tr_loss_val
             # prefill losses after init val calculated
             if not(only_thresholds):
-                tr_losses, te_losses=fill_losses(tr_losses, te_losses, i)
+                if otherreturns is not None:
+                    for name, fn in items:
+                        m = kwargs.get("monomial", None)
+                        val = np.array(fn(model=model.model, X_tr=X_tr, y_tr=y_tr, X_te=X_te, y_te=y_te, monomial=m)) #the model.model to unwrap from centeredMLP
+                        shape = (max_iter,) + val.shape
+                        extras[name] = np.empty(shape, dtype=val.dtype)
+                        # extras[name][:]= val
+                tr_losses, te_losses, extras=fill_losses(tr_losses, te_losses, extras, i)
 
         ema_tr = (ema_smoother * ema_tr + (1.0 - ema_smoother) * tr_loss_val)
         ema_te = (ema_smoother * ema_te + (1.0 - ema_smoother) * te_loss_val)
         if not(only_thresholds):
             tr_losses[i] = ema_tr
             te_losses[i] = ema_te
-
+            if otherreturns is not None:
+                for name, fn in items:
+                    val = fn(model=model.model, X_tr=X_tr, y_tr=y_tr, X_te=X_te, y_te=y_te, monomial=kwargs.get("monomial", None)) #the model.model to unwrap from centeredMLP
+                    extras[name][i] = val
+                    
         if verbose:
             print(f"Step {i}: ema train loss {ema_tr}, ema test loss {ema_te}")
 
@@ -165,21 +201,26 @@ def train_network(model, batch_function, lr=1e-2, max_iter=int(1e3), loss_checkp
         if stopper is not None:
             stop, _ = stopper.update(i, te_loss_val)
             if not(only_thresholds):
-                tr_losses, te_losses=fill_losses(tr_losses, te_losses, i)
+                tr_losses, te_losses, extras=fill_losses(tr_losses, te_losses, extras, i)
             if stop:
-                return return_statement(model, ema_tr, ema_te, timekeys, tr_losses, te_losses)
+                return return_statement(model, ema_tr, ema_te, timekeys, tr_losses, te_losses, extras)
+
         # if a threshold is hit, update pointer
         while pointer < len(thresholds) and ema_tr < thresholds[pointer]:
             timekeys[pointer] = i
             if not(only_thresholds):
-                tr_losses, te_losses=fill_losses(tr_losses, te_losses, i)
+                tr_losses, te_losses, extras=fill_losses(tr_losses, te_losses, extras, i)
             pointer += 1
 
         # early exit if all thresholds crossed
         if pointer == len(thresholds):
-            return return_statement(model, ema_tr, ema_te, timekeys, tr_losses, te_losses)
+            if otherreturns is not None and only_thresholds:
+                for name, fn in items:
+                    val = fn(model=model.model, X_tr=X_tr, y_tr=y_tr, X_te=X_te, y_te=y_te, monomial=kwargs.get("monomial", None))
+                    extras[name] = val#float(val)
+            return return_statement(model, ema_tr, ema_te, timekeys, tr_losses, te_losses, extras)
 
-    return return_statement(model, ema_tr, ema_te, timekeys, tr_losses, te_losses)
+    return return_statement(model, ema_tr, ema_te, timekeys, tr_losses, te_losses, extras)
 
 
 # for checking when training has plateaued; discard if we want the full training run

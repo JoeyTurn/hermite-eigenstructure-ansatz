@@ -2,15 +2,7 @@ import torch
 import numpy as np
 from utils import ensure_torch
 from feature_decomp import generate_hea_monomials
-from data import get_powerlaw, compute_hermite_basis
-
-def get_synthetic_X(d=500, N=15000, offset=3, alpha=1.5, data_eigvals = None, gen=None, **kwargs):
-    """
-    Powerlaw synthetic data
-    """
-    data_eigvals = get_powerlaw(d, alpha, offset=offset, normalize=True) if data_eigvals is None else data_eigvals
-    X = ensure_torch(torch.normal(0, 1, (N, d), generator=gen, device=data_eigvals.device)) * torch.sqrt(data_eigvals)
-    return X, data_eigvals
+from data import get_powerlaw, compute_hermite_basis, get_synthetic_X
 
 def get_synthetic_dataset(X=None, data_eigvals=None, d=500, N=15000, offset=3, alpha=1.5, cutoff_mode=10000,
                           noise_size=0.1, yoffset=3, beta=1.2, normalized=True, gen=None, **kwargs):
@@ -25,7 +17,7 @@ def get_synthetic_dataset(X=None, data_eigvals=None, d=500, N=15000, offset=3, a
     fra_eigvals, monomials = generate_hea_monomials(data_eigvals, cutoff_mode, kerneltype.get_level_coeff_fn(kernel_width=kernel_width, data_eigvals=data_eigvals, **kwargs), kmax=kwargs.get('kmax', 9))
     H = ensure_torch(compute_hermite_basis(X, monomials))
     fra_eigvals = ensure_torch(fra_eigvals)
-    v_true = get_powerlaw(H.shape[1], beta/2, offset=yoffset, normalize=normalized)
+    v_true = ensure_torch(get_powerlaw(H.shape[1], beta/2, offset=yoffset, normalize=normalized))
     v_true = v_true if not normalized else v_true/torch.linalg.norm(v_true)* N**(0.5)
     y = ensure_torch(H) @ v_true + ensure_torch(torch.normal(0., noise_size, (H.shape[0],), generator=gen, device=H.device))#/H.shape[0]**(0.5)
     return X, y, H, monomials, fra_eigvals, v_true, data_eigvals
