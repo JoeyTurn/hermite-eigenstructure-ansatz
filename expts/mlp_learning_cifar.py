@@ -1,4 +1,8 @@
+import argparse
+import json
 import os
+import sys
+
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -6,20 +10,16 @@ import torch.multiprocessing as mp
 from modelscape.backend.cli import parse_args
 from modelscape.backend.job_iterator import main as run_job_iterator
 from modelscape.data.ntk_coeffs import get_relu_level_coeff_fn
-from modelscape.data.data import get_new_polynomial_data
 from modelscape.model import MLP
-
-import sys, os, json
-import argparse
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data import get_synthetic_X, get_powerlaw
+from data import get_binarized_dataset, get_matrix_hermites, preprocess
 from feature_decomp import Monomial, generate_hea_monomials
 from scripts.get_spaced_eigvals import select_indices_with_geometric_decay
-from utils import ensure_torch, ensure_numpy
+from utils import ensure_numpy, ensure_torch
 
 from FileManager import FileManager
 
@@ -39,7 +39,7 @@ def load_config(path):
     """
     _, ext = os.path.splitext(path)
     ext = ext.lower()
-    with open(path, 'r') as f:
+    with open(path, "r") as f:
         if ext in {".yaml", ".yml"}:
             try:
                 import yaml
@@ -53,25 +53,42 @@ def load_config(path):
             return json.load(f)
     raise ValueError(f"Unsupported configuration file extension: {ext}")
 
+
 DEFAULT_INDICES_OF_INTEREST = [0, 1, 2, 3, 5, 10, 15, 20, 30, 40, 60, 80, 100, 180]
 
 
-def polynomial_batch_fn(lambdas, Vt, monomials, bsz, data_eigvals, N=10,
-                X=None, y=None, data_creation_fn=get_new_polynomial_data, gen=None):
-    lambdas, Vt, data_eigvals = map(ensure_torch, (lambdas, Vt, data_eigvals))
-    dim = len(data_eigvals)
+def cifar_batch_fn(X_data, pca_data, monomials, bsz, X=None, y=None, gen=None, **_):
+    """
+    Fixed CIFAR data batch function compatible with modelscape.run_job:
+    - If X and y are provided, always returns that fixed pair.
+    - Otherwise samples a random minibatch from preprocessed CIFAR data.
+
+    Target y is defined by the requested monomial on PCA-normalized coordinates.
+    """
+    X_data, pca_data = map(ensure_torch, (X_data, pca_data))
+    if bsz <= 0:
+        raise ValueError(f"bsz must be positive, got {bsz}")
+
+    if monomials is None:
+        raise ValueError("monomials must be provided by iterator_names/job")
+
+    # Build labels once per job/monomial.
+    y_full = get_matrix_hermites(X=pca_data, monomials=monomials, previously_normalized=True)
+    y_full = ensure_torch(y_full)
+    if y_full.ndim == 2:
+        y_full = y_full.sum(dim=1) / y_full.shape[1]
+    y_full = y_full * (X_data.shape[0] ** 0.5)
 
     def batch_fn(step: int, X=X, y=y):
         if (X is not None) and (y is not None):
-            X_fixed = ensure_torch(X)
-            y_fixed = ensure_torch(y)
-            return X_fixed, y_fixed
-        with torch.no_grad():
-            dcf_args = dict(lambdas=lambdas, Vt=Vt, monomials=monomials, dim=dim,
-                            N=bsz, data_eigvals=data_eigvals, N_original=N, gen=gen)
-            X, y = data_creation_fn(**dcf_args)
-        X, y = map(ensure_torch, (X, y))
-        return X, y
+            return ensure_torch(X), ensure_torch(y)
+
+        n_total = X_data.shape[0]
+        if bsz >= n_total:
+            return X_data, y_full
+
+        idx = torch.randint(0, n_total, (bsz,), generator=gen, device=X_data.device)
+        return X_data[idx], y_full[idx]
 
     return batch_fn
 
@@ -91,7 +108,6 @@ def _get_spacing_config(args):
     for key in list(cfg.keys()):
         if hasattr(args, key):
             cfg[key] = getattr(args, key)
-        # allow uppercase variants from config
         upper_key = key.upper()
         if hasattr(args, upper_key):
             cfg[key] = getattr(args, upper_key)
@@ -99,16 +115,14 @@ def _get_spacing_config(args):
 
 
 def _get_spaced_targets(data_eigvals, datasethps, spacing_cfg):
-    d = int(datasethps["d"])
-    alpha = float(datasethps["alpha"])
-    offset = float(datasethps.get("offset", 6))
-
     if data_eigvals is None:
-        data_eigvals = get_powerlaw(P=d, exp=alpha, offset=offset, normalize=True)
-    data_eigvals = ensure_numpy(data_eigvals)
+        raise ValueError("data_eigvals must be provided for CIFAR target generation")
 
-    weight_variance = float(datasethps.get("weight_variance", 1))
-    bias_variance = float(datasethps.get("bias_variance", 1))
+    data_eigvals = ensure_numpy(data_eigvals)
+    d = int(len(data_eigvals))
+
+    weight_variance = float(datasethps.get("weight_variance", 1.0))
+    bias_variance = float(datasethps.get("bias_variance", 1.0))
     level_coeff_fn = get_relu_level_coeff_fn(
         data_eigvals=data_eigvals,
         weight_variance=weight_variance,
@@ -121,13 +135,15 @@ def _get_spaced_targets(data_eigvals, datasethps, spacing_cfg):
     else:
         data_indices = np.asarray(indices_of_interest, dtype=int)
 
+    if data_indices.size == 0:
+        raise ValueError("indices_of_interest must contain at least one index")
     if data_indices.max() >= d:
         raise ValueError(f"indices_of_interest has entries >= d ({d})")
 
     gammas_of_interest = data_eigvals[data_indices]
     hea_eigvals, monomials = generate_hea_monomials(
         gammas_of_interest,
-        num_monomials=int(datasethps["cutoff_mode"]),
+        num_monomials=int(datasethps.get("cutoff_mode", 40000)),
         eval_level_coeff=level_coeff_fn,
         kmax=int(spacing_cfg.get("kmax", 6)),
     )
@@ -167,14 +183,40 @@ def _get_spaced_targets(data_eigvals, datasethps, spacing_cfg):
     return selected_monomials, selected_eigvals, meta
 
 
+def _load_and_preprocess_cifar(args):
+    datasethps = dict(getattr(args, "datasethps", {}) or {})
+    dataset = str(datasethps.get("dataset", "cifar5m")).lower()
+    if dataset != "cifar5m":
+        raise ValueError(f"Expected dataset='cifar5m', got {dataset!r}")
+
+    classes = datasethps.get("classes", None)
+    center = bool(datasethps.get("center", True))
+    normalize = bool(datasethps.get("normalize", False))
+    zca_strength = float(datasethps.get("zca_strength", 0.0))
+
+    X_raw, _ = get_binarized_dataset(dataset, classes, int(args.N_TOT))
+    X_full = ensure_torch(X_raw)
+    X_full = preprocess(X_full, center=center, normalize=normalize, zca_strength=zca_strength)
+
+    U, lambdas, _ = torch.linalg.svd(X_full, full_matrices=False)
+    total_energy = torch.sum(lambdas ** 2)
+    X_full = X_full * torch.sqrt(torch.tensor(float(args.N_TOT), device=X_full.device) / total_energy)
+
+    # Global PCA coordinates used for monomial target labels.
+    pca_full = (float(args.N_TOT) ** 0.5) * U
+    data_eigvals = (lambdas ** 2) / total_energy
+
+    return X_full, pca_full, data_eigvals, datasethps
+
+
 if __name__ == "__main__":
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=str, default=None)
     pre_args, remaining_argv = pre_parser.parse_known_args()
     sys.argv = [sys.argv[0]] + remaining_argv
 
-    args = parse_args()  # default args
-    
+    args = parse_args()
+
     expt_dir = os.path.dirname(__file__)
     if pre_args.config:
         if os.path.isabs(pre_args.config):
@@ -186,6 +228,9 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"Config file not found: {pre_args.config}")
     else:
         config_candidates = [
+            "mlp_cifar_config.yaml",
+            "mlp_cifar_config.yml",
+            "mlp_cifar_config.json",
             "mlp_config.yaml",
             "mlp_config.yml",
             "mlp_config.json",
@@ -194,10 +239,14 @@ if __name__ == "__main__":
             "config.json",
         ]
         config_path = next(
-            (os.path.join(expt_dir, name) for name in config_candidates
-             if os.path.exists(os.path.join(expt_dir, name))),
+            (
+                os.path.join(expt_dir, name)
+                for name in config_candidates
+                if os.path.exists(os.path.join(expt_dir, name))
+            ),
             None,
         )
+
     config = load_config(config_path) if config_path else {}
     for key, value in config.items():
         setattr(args, key, value)
@@ -205,31 +254,11 @@ if __name__ == "__main__":
     args.MODEL_CLASS = MLP
     args.post_init_fn = _post_init_mupify
 
-    # --- Threshold config (time-to-learn at EMA test < 0.1) ---
     ttl_threshold = float(getattr(args, "TTL_THRESHOLD", 0.1))
     args.LOSS_CHECKPOINTS = [ttl_threshold]
     args.ONLYTHRESHOLDS = True
 
-    args.N_TOT = args.N_TEST + args.N_TRAIN
-
-    # --- Target monomials (spaced HEA eigvals) ---
-    spacing_cfg = _get_spacing_config(args)
-
-    # Build synthetic data once to fix data_eigvals + PCA for batch function
-    gen = torch.Generator(device="cuda").manual_seed(args.SEED)
-    X_full, data_eigvals = get_synthetic_X(**args.datasethps, N=args.N_TOT, gen=gen)
-
-    target_monomials, target_hea_eigvals, target_meta = _get_spaced_targets(
-        data_eigvals=data_eigvals,
-        datasethps=args.datasethps,
-        spacing_cfg=spacing_cfg,
-    )
-
-    # Force targets to spaced HEA monomials (first N = spacing_cfg["num_targets"])
-    args.TARGET_MONOMIALS = target_monomials
-
-    iterators = [args.N_SAMPLES, range(args.NUM_TRIALS), args.TARGET_MONOMIALS]
-    iterator_names = ["ntrain", "trial", "monomials"]
+    args.N_TOT = int(args.N_TEST) + int(args.N_TRAIN)
 
     datapath = os.getenv("DATASETPATH")
     exptpath = os.getenv("RESULTPATH")
@@ -237,7 +266,22 @@ if __name__ == "__main__":
         raise ValueError("must set $DATASETPATH environment variable")
     if exptpath is None:
         raise ValueError("must set $RESULTPATH environment variable")
-    expt_dir = os.path.join(exptpath, config.get("expt_dir"))
+
+    X_full, pca_full, data_eigvals, datasethps = _load_and_preprocess_cifar(args)
+
+    spacing_cfg = _get_spacing_config(args)
+    target_monomials, target_hea_eigvals, target_meta = _get_spaced_targets(
+        data_eigvals=data_eigvals,
+        datasethps=datasethps,
+        spacing_cfg=spacing_cfg,
+    )
+    args.TARGET_MONOMIALS = target_monomials
+
+    iterators = [args.N_SAMPLES, range(args.NUM_TRIALS), args.TARGET_MONOMIALS]
+    iterator_names = ["ntrain", "trial", "monomials"]
+
+    expt_subdir = config.get("expt_dir") or "hermite-eigenstructure-ansatz/mlp/cifar5m"
+    expt_dir = os.path.join(exptpath, expt_subdir)
     dir_suffix = config.get("dir_suffix")
     if dir_suffix:
         expt_dir = f"{expt_dir}_{dir_suffix}"
@@ -247,15 +291,15 @@ if __name__ == "__main__":
     expt_fm = FileManager(expt_dir)
     print(f"Working in directory {expt_dir}.")
 
-    U, lambdas, Vt = torch.linalg.svd(X_full, full_matrices=False)
-    dim = X_full.shape[1]
-    args.DIM = dim
+    args.DIM = int(X_full.shape[1])
 
-    # --- Target function defs ---
-    bfn_config = dict(lambdas=lambdas, Vt=Vt, data_eigvals=data_eigvals, N=args.N_TOT, base_bfn=polynomial_batch_fn)
+    bfn_config = {
+        "X_data": X_full,
+        "pca_data": pca_full,
+        "base_bfn": cifar_batch_fn,
+    }
 
     global_config = args.__dict__.copy()
-
     grabs = {}
     global_config.update({"otherreturns": grabs})
 
@@ -263,31 +307,39 @@ if __name__ == "__main__":
 
     result = run_job_iterator(iterators, iterator_names, global_config, bfn_config=bfn_config)
 
-    # Attach metadata for plotting
     monomial_strs = [str(m) for m in target_monomials]
     monomial_bases = [m.basis() for m in target_monomials]
     target_map = {str(m): float(ev) for m, ev in zip(target_monomials, target_hea_eigvals)}
-    result.update({
-        "ttl_threshold": ttl_threshold,
-        "loss_checkpoints": list(args.LOSS_CHECKPOINTS),
-        "target_info": {
-            "monomial_strs": monomial_strs,
-            "monomial_bases": monomial_bases,
-            "hea_eigvals": [float(x) for x in target_hea_eigvals],
-            "monomial_str_to_eigval": target_map,
-            **target_meta,
-        },
-        "training_config": {
-            "LR": float(args.LR),
-            "MAX_ITER": int(args.MAX_ITER),
-            "EMA_SMOOTHER": float(args.EMA_SMOOTHER),
-            "ONLINE": bool(args.ONLINE),
-            "N_TRAIN": int(args.N_TRAIN),
-            "N_TEST": int(args.N_TEST),
-            "N_SAMPLES": list(args.N_SAMPLES),
-            "NUM_TRIALS": int(args.NUM_TRIALS),
-        },
-    })
+    result.update(
+        {
+            "ttl_threshold": ttl_threshold,
+            "loss_checkpoints": list(args.LOSS_CHECKPOINTS),
+            "target_info": {
+                "monomial_strs": monomial_strs,
+                "monomial_bases": monomial_bases,
+                "hea_eigvals": [float(x) for x in target_hea_eigvals],
+                "monomial_str_to_eigval": target_map,
+                **target_meta,
+            },
+            "training_config": {
+                "LR": float(args.LR),
+                "MAX_ITER": int(args.MAX_ITER),
+                "EMA_SMOOTHER": float(args.EMA_SMOOTHER),
+                "ONLINE": bool(args.ONLINE),
+                "N_TRAIN": int(args.N_TRAIN),
+                "N_TEST": int(args.N_TEST),
+                "N_SAMPLES": list(args.N_SAMPLES),
+                "NUM_TRIALS": int(args.NUM_TRIALS),
+            },
+            "dataset_config": {
+                "dataset": datasethps.get("dataset", "cifar5m"),
+                "center": bool(datasethps.get("center", True)),
+                "normalize": bool(datasethps.get("normalize", False)),
+                "zca_strength": float(datasethps.get("zca_strength", 0.0)),
+                "classes": datasethps.get("classes", None),
+            },
+        }
+    )
 
     print(f"Results saved to {expt_dir}")
     expt_fm.save(result, "result_ttl.pickle")

@@ -1,0 +1,32 @@
+# MLP training overrides
+ONLINE: true
+N_TRAIN: 4000
+N_TEST: 1000
+N_SAMPLES: [1024]
+width: 8192
+depth: 1
+bias: True
+NUM_TRIALS: 2
+MAX_ITER: 5000
+LR: 0.02
+
+# TARGET_MONOMIALS:
+#   - {0: 1}
+#   - {1: 1}
+
+# Dataset hyperparameters
+datasethps:
+  normalized: true
+  cutoff_mode: 40000
+  d: 200
+  offset: 6
+  alpha: 1.7
+  noise_size: 1
+  yoffset: 1.2
+  beta: 1.2
+  binarize: false
+  weight_variance: 1
+  bias_variance: 1
+
+expt_dir: hermite-eigenstructure-ansatz/mlp/synthetic
+dir_suffix: low_depth_low_lr
