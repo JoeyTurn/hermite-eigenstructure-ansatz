@@ -52,7 +52,6 @@ def select_indices_with_geometric_decay(hea_eigvals, ratio=.9):
     selected_indices = []
 
     cur_eigval_thresh = hea_eigvals[0] + 1
-    ratio = .9
 
     for i in range(len(hea_eigvals)):
         if hea_eigvals[i] < cur_eigval_thresh:
